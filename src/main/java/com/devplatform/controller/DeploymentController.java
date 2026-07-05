@@ -64,7 +64,7 @@ public class DeploymentController {
     public Deployment rollback(@PathVariable Long id,
                                @RequestBody(required = false) RollbackRequest request,
                                @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
-        String deployedBy = request == null ? null : request.deployedBy();
+        String deployedBy = request == null ? "Unknown" : request.deployedBy();
         return deploymentManager.rollback(id, deployedBy, idempotencyKey);
     }
 
