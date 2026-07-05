@@ -10,6 +10,8 @@ import com.devplatform.service.DeploymentManager;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -30,25 +32,31 @@ import java.util.List;
 @RequiredArgsConstructor
 public class DeploymentController {
 
+    private static final Logger logger = LoggerFactory.getLogger(DeploymentController.class);
+
     private final DeploymentManager deploymentManager;
 
     @GetMapping
     public List<Deployment> getAll() {
+        logger.info("Get all deployments endpoint hit.");
         return deploymentManager.getAll();
     }
 
     @GetMapping("/{id}")
     public Deployment getById(@PathVariable Long id) {
+        logger.info("Get deployment endpoint hit with id: {} ", id);
         return deploymentManager.getById(id);
     }
 
     @GetMapping("/current")
     public List<Deployment> getCurrentByEnvironment(@RequestParam String environment) {
+        logger.info("Get current deployment endpoint hit with environment: {} .", environment);
         return deploymentManager.getCurrentByEnvironment(environment);
     }
 
     @GetMapping("/{id}/history")
     public List<History> getHistory(@PathVariable Long id) {
+        logger.info("Get deployment history endpoint hit with id: {}.", id);
         return deploymentManager.getHistory(id);
     }
 
@@ -56,6 +64,7 @@ public class DeploymentController {
     @ResponseStatus(HttpStatus.CREATED)
     public Deployment create(@Valid @RequestBody DeploymentRequest request,
                              @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
+        logger.info("Create deployment endpoint hit with request: {} and idempotencyKey: {}.", request.toString(), idempotencyKey);
         return deploymentManager.create(request, idempotencyKey);
     }
 
@@ -65,17 +74,21 @@ public class DeploymentController {
                                @RequestBody(required = false) RollbackRequest request,
                                @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
         String deployedBy = request == null ? "Unknown" : request.deployedBy();
+        logger.info("Rollback deployment endpoint hit with id: {}, request: {}, and idempotencyKey: {}.",
+                id, request != null ? request.toString() : "", idempotencyKey);
         return deploymentManager.rollback(id, deployedBy, idempotencyKey);
     }
 
     @PatchMapping("/{id}/status")
     public Deployment updateStatus(@PathVariable Long id, @RequestBody DeploymentStatus status) {
+        logger.info("Update deployment status endpoint hit with id: {} and status: {}.", id, status);
         return deploymentManager.updateStatus(id, status);
     }
 
     @DeleteMapping("/{id}")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void delete(@PathVariable Long id) {
+        logger.info("Delete deployment endpoint hit with id: {}.", id);
         deploymentManager.delete(id);
     }
 }

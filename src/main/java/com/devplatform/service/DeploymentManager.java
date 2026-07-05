@@ -17,6 +17,9 @@ import io.micrometer.core.instrument.MeterRegistry;
 
 import lombok.RequiredArgsConstructor;
 
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
@@ -28,6 +31,8 @@ import java.util.Optional;
 @org.springframework.stereotype.Service
 @RequiredArgsConstructor
 public class DeploymentManager {
+
+    private static final Logger logger = LoggerFactory.getLogger(DeploymentManager.class);
 
     private final DeploymentRepository deploymentRepository;
     private final ServiceRepository serviceRepository;
@@ -50,9 +55,15 @@ public class DeploymentManager {
 
     @Transactional
     public Deployment create(DeploymentRequest request, String idempotencyKey) {
-        if (idempotencyKey != null && !idempotencyKey.isBlank()) {
+
+        if (!StringUtils.isBlank(idempotencyKey )) {
+            logger.info("Create called with existing idempotencyKey: {}", idempotencyKey);
             Optional<Deployment> existing = deploymentRepository.findByIdempotencyKey(idempotencyKey);
-            if (existing.isPresent()) return existing.get();
+            if (existing.isPresent()) {
+                logger.info("Returning existing deployment: {} with idempotencyKey: {}",
+                        existing.get().getId(), idempotencyKey);
+                return existing.get();
+            }
         }
 
         Service service = serviceRepository.findByName(request.serviceName())
