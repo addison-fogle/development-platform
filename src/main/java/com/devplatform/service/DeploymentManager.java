@@ -49,75 +49,50 @@ public class DeploymentManager {
 
     @Transactional
     public Deployment create(DeploymentRequest request, String idempotencyKey) {
+        String normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey);
 
-        if (!StringUtils.isBlank(idempotencyKey )) {
-            Optional<Deployment> existing = deploymentRepository.findByIdempotencyKey(idempotencyKey);
-            if (existing.isPresent()) {
-                log.info("Found existing deployment: {} with idempotencyKey: {}",
-                        existing.get().getId(), idempotencyKey);
-                return existing.get();
-            } else {
-                String errorMessage = "No deployment found with existing idempotencyKey: " + idempotencyKey;
-                log.warn(errorMessage);
-                throw new NotFoundException(errorMessage);
-            }
+        Optional<Deployment> existing = findExistingDeployment(normalizedIdempotencyKey);
+        if (existing.isPresent()) {
+            log.info("Found existing deployment: {} with idempotencyKey: {}",
+                    existing.get().getId(), normalizedIdempotencyKey);
+            return existing.get();
         }
 
-        Optional<Service> service = serviceRepository.findByName(request.serviceName());
-        if (service.isEmpty()) {
-            log.warn("Service name {} was not found", request.serviceName());
-            throw new NotFoundException("Service was not found: " + request.serviceName());
-        }
-        Optional<Environment> environment = environmentRepository.findByName(request.environment());
-        if (environment.isEmpty()) {
-            log.warn("Environment {} was not found", request.environment());
-            throw new NotFoundException("Environment was not found: " + request.environment());
-        }
+        Service service = getRequiredService(request.serviceName());
+        Environment environment = getRequiredEnvironment(request.environment());
 
-        deploymentPolicy.validateCreate(request, service.get(), environment.get());
+        deploymentPolicy.validateCreate(request, service, environment);
 
-        Deployment deployment = new Deployment();
-        deployment.setService(service.get());
-        deployment.setEnvironment(environment.get());
-        deployment.setImageTag(request.imageTag());
-        deployment.setDeployedBy(request.deployedBy());
-        deployment.setStatus(DeploymentStatus.PENDING);
-        deployment.setCurrent(false);
-        deployment.setIdempotencyKey(idempotencyKey);
+        Deployment deployment = newPendingDeployment(
+                service,
+                environment,
+                request.imageTag(),
+                request.deployedBy(),
+                normalizedIdempotencyKey);
 
-        Deployment saved;
-        try {
-            saved = deploymentRepository.saveAndFlush(deployment);
-        } catch (DataIntegrityViolationException ex) {
-            if (idempotencyKey != null) {
-                return deploymentRepository.findByIdempotencyKey(idempotencyKey)
-                        .orElseThrow(() -> ex);
-            }
-            throw ex;
-        }
+        Deployment saved = saveHandlingIdempotencyConflict(deployment, normalizedIdempotencyKey);
         publishAfterCommit(() -> eventPublisher.publishCreated(saved));
         return saved;
     }
 
+    @Transactional(readOnly = true)
     public Deployment getById(Long id) {
-        return deploymentRepository.getReferenceById(id);
+        return getRequiredDeployment(id);
     }
+
     @Transactional
     public Deployment rollback(Long id, String deployedBy, String idempotencyKey) {
-        Deployment target = deploymentRepository.getReferenceById(id);
+        String normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey);
 
-        if (!StringUtils.isBlank(idempotencyKey)) {
-            Optional<Deployment> existing = deploymentRepository.findByIdempotencyKey(idempotencyKey);
-            if (existing.isPresent()) return existing.get();
+        Optional<Deployment> existing = findExistingDeployment(normalizedIdempotencyKey);
+        if (existing.isPresent()) {
+            log.info("Found existing rollback deployment: {} with idempotencyKey: {}",
+                    existing.get().getId(), normalizedIdempotencyKey);
+            return existing.get();
         }
 
-        Deployment previous = deploymentRepository
-                .findTopByServiceAndEnvironmentAndStatusAndIdLessThanOrderByIdDesc(
-                        target.getService(),
-                        target.getEnvironment(),
-                        DeploymentStatus.SUCCEEDED,
-                        target.getId())
-                .orElseThrow(() -> new NotFoundException("No previous successful deployment found for rollback: " + id));
+        Deployment target = getRequiredDeployment(id);
+        Deployment previous = getPreviousSuccessfulDeployment(target);
 
         DeploymentRequest request = new DeploymentRequest(
                 target.getService().getName(),
@@ -126,38 +101,23 @@ public class DeploymentManager {
                 deployedBy);
         deploymentPolicy.validateCreate(request, target.getService(), target.getEnvironment());
 
-        Deployment rollback = new Deployment();
-        rollback.setService(target.getService());
-        rollback.setEnvironment(target.getEnvironment());
-        rollback.setImageTag(previous.getImageTag());
-        rollback.setDeployedBy(deployedBy);
-        rollback.setStatus(DeploymentStatus.PENDING);
-        rollback.setCurrent(false);
-        rollback.setIdempotencyKey(idempotencyKey);
+        Deployment rollback = newPendingDeployment(
+                target.getService(),
+                target.getEnvironment(),
+                previous.getImageTag(),
+                deployedBy,
+                normalizedIdempotencyKey);
 
-        Deployment saved;
-        try {
-            saved = deploymentRepository.saveAndFlush(rollback);
-        } catch (DataIntegrityViolationException ex) {
-            if (idempotencyKey != null) {
-                return deploymentRepository.findByIdempotencyKey(idempotencyKey)
-                        .orElseThrow(() -> ex);
-            }
-            throw ex;
-        }
-
+        Deployment saved = saveHandlingIdempotencyConflict(rollback, normalizedIdempotencyKey);
         historyManager.record(saved, null, DeploymentStatus.PENDING);
         publishAfterCommit(() -> eventPublisher.publishCreated(saved));
-        Counter.builder("deployments.rollback.created")
-                .tag("environment", target.getEnvironment().getName())
-                .register(meterRegistry)
-                .increment();
+        incrementRollbackCreated(target.getEnvironment());
         return saved;
     }
 
     @Transactional
     public Deployment updateStatus(Long id, DeploymentStatus status) {
-        Deployment deployment = deploymentRepository.getReferenceById(id);;
+        Deployment deployment = getRequiredDeployment(id);
         DeploymentStatus previous = deployment.getStatus();
 
         deployment.setStatus(status);
@@ -170,11 +130,7 @@ public class DeploymentManager {
         Deployment saved = deploymentRepository.save(deployment);
         historyManager.record(saved, previous, status);
 
-        Counter.builder("deployments.status.transitions")
-                .tag("from", previous.name())
-                .tag("to", status.name())
-                .register(meterRegistry)
-                .increment();
+        incrementStatusTransition(previous, status);
 
         publishAfterCommit(() -> eventPublisher.publishStatusChanged(saved, previous));
         return saved;
@@ -184,17 +140,107 @@ public class DeploymentManager {
         return historyManager.getByDeploymentId(deploymentId);
     }
 
+    @Transactional
     public void delete(Long id) {
-        Deployment deployment = deploymentRepository.getReferenceById(id);
+        Deployment deployment = getRequiredDeployment(id);
         historyManager.deleteByDeploymentId(deployment.getId());
         deploymentRepository.delete(deployment);
     }
 
     @Transactional(readOnly = true)
     public List<Deployment> getCurrentByEnvironment(String environmentName) {
-        Environment environment = environmentRepository.findByName(environmentName)
-                .orElseThrow(() -> new NotFoundException("Environment not found: " + environmentName));
+        Environment environment = getRequiredEnvironment(environmentName);
         return deploymentRepository.findByEnvironmentAndCurrentTrue(environment);
+    }
+
+    private Optional<Deployment> findExistingDeployment(String idempotencyKey) {
+        if (idempotencyKey == null) {
+            return Optional.empty();
+        }
+        return deploymentRepository.findByIdempotencyKey(idempotencyKey);
+    }
+
+    private Deployment getRequiredDeployment(Long id) {
+        return deploymentRepository.findById(id)
+                .orElseThrow(() -> new NotFoundException("Deployment not found: " + id));
+    }
+
+    private Service getRequiredService(String serviceName) {
+        return serviceRepository.findByName(serviceName)
+                .orElseThrow(() -> {
+                    log.warn("Service name {} was not found", serviceName);
+                    return new NotFoundException("Service was not found: " + serviceName);
+                });
+    }
+
+    private Environment getRequiredEnvironment(String environmentName) {
+        return environmentRepository.findByName(environmentName)
+                .orElseThrow(() -> {
+                    log.warn("Environment {} was not found", environmentName);
+                    return new NotFoundException("Environment was not found: " + environmentName);
+                });
+    }
+
+    private Deployment getPreviousSuccessfulDeployment(Deployment target) {
+        return deploymentRepository
+                .findTopByServiceAndEnvironmentAndStatusAndIdLessThanOrderByIdDesc(
+                        target.getService(),
+                        target.getEnvironment(),
+                        DeploymentStatus.SUCCEEDED,
+                        target.getId())
+                .orElseThrow(() -> new NotFoundException(
+                        "No previous successful deployment found for rollback: " + target.getId()));
+    }
+
+    private Deployment newPendingDeployment(
+            Service service,
+            Environment environment,
+            String imageTag,
+            String deployedBy,
+            String idempotencyKey) {
+        Deployment deployment = new Deployment();
+        deployment.setService(service);
+        deployment.setEnvironment(environment);
+        deployment.setImageTag(imageTag);
+        deployment.setDeployedBy(deployedBy);
+        deployment.setStatus(DeploymentStatus.PENDING);
+        deployment.setCurrent(false);
+        deployment.setIdempotencyKey(idempotencyKey);
+        return deployment;
+    }
+
+    private Deployment saveHandlingIdempotencyConflict(Deployment deployment, String idempotencyKey) {
+        try {
+            return deploymentRepository.saveAndFlush(deployment);
+        } catch (DataIntegrityViolationException ex) {
+            if (idempotencyKey == null) {
+                throw ex;
+            }
+            return deploymentRepository.findByIdempotencyKey(idempotencyKey)
+                    .orElseThrow(() -> ex);
+        }
+    }
+
+    private String normalizeIdempotencyKey(String idempotencyKey) {
+        if (StringUtils.isBlank(idempotencyKey)) {
+            return null;
+        }
+        return idempotencyKey.trim();
+    }
+
+    private void incrementRollbackCreated(Environment environment) {
+        Counter.builder("deployments.rollback.created")
+                .tag("environment", environment.getName())
+                .register(meterRegistry)
+                .increment();
+    }
+
+    private void incrementStatusTransition(DeploymentStatus previous, DeploymentStatus status) {
+        Counter.builder("deployments.status.transitions")
+                .tag("from", previous.name())
+                .tag("to", status.name())
+                .register(meterRegistry)
+                .increment();
     }
 
     private void publishAfterCommit(Runnable action) {
