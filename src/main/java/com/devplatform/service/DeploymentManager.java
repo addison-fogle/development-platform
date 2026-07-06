@@ -32,7 +32,7 @@ import java.util.Optional;
 @RequiredArgsConstructor
 public class DeploymentManager {
 
-    private static final Logger logger = LoggerFactory.getLogger(DeploymentManager.class);
+    private static final Logger log = LoggerFactory.getLogger(DeploymentManager.class);
 
     private final DeploymentRepository deploymentRepository;
     private final ServiceRepository serviceRepository;
@@ -47,35 +47,38 @@ public class DeploymentManager {
         return deploymentRepository.findAll();
     }
 
-    @Transactional(readOnly = true)
-    public Deployment getById(Long id) {
-        return deploymentRepository.findById(id)
-                .orElseThrow(() -> new NotFoundException("Deployment not found: " + id));
-    }
-
     @Transactional
     public Deployment create(DeploymentRequest request, String idempotencyKey) {
 
         if (!StringUtils.isBlank(idempotencyKey )) {
-            logger.info("Create called with existing idempotencyKey: {}", idempotencyKey);
             Optional<Deployment> existing = deploymentRepository.findByIdempotencyKey(idempotencyKey);
             if (existing.isPresent()) {
-                logger.info("Returning existing deployment: {} with idempotencyKey: {}",
+                log.info("Found existing deployment: {} with idempotencyKey: {}",
                         existing.get().getId(), idempotencyKey);
                 return existing.get();
+            } else {
+                String errorMessage = "No deployment found with existing idempotencyKey: " + idempotencyKey;
+                log.warn(errorMessage);
+                throw new NotFoundException(errorMessage);
             }
         }
 
-        Service service = serviceRepository.findByName(request.serviceName())
-                .orElseThrow(() -> new NotFoundException("Service not found: " + request.serviceName()));
-        Environment environment = environmentRepository.findByName(request.environment())
-                .orElseThrow(() -> new NotFoundException("Environment not found: " + request.environment()));
+        Optional<Service> service = serviceRepository.findByName(request.serviceName());
+        if (service.isEmpty()) {
+            log.warn("Service name {} was not found", request.serviceName());
+            throw new NotFoundException("Service was not found: " + request.serviceName());
+        }
+        Optional<Environment> environment = environmentRepository.findByName(request.environment());
+        if (environment.isEmpty()) {
+            log.warn("Environment {} was not found", request.environment());
+            throw new NotFoundException("Environment was not found: " + request.environment());
+        }
 
-        deploymentPolicy.validateCreate(request, service, environment);
+        deploymentPolicy.validateCreate(request, service.get(), environment.get());
 
         Deployment deployment = new Deployment();
-        deployment.setService(service);
-        deployment.setEnvironment(environment);
+        deployment.setService(service.get());
+        deployment.setEnvironment(environment.get());
         deployment.setImageTag(request.imageTag());
         deployment.setDeployedBy(request.deployedBy());
         deployment.setStatus(DeploymentStatus.PENDING);
@@ -96,11 +99,14 @@ public class DeploymentManager {
         return saved;
     }
 
+    public Deployment getById(Long id) {
+        return deploymentRepository.getReferenceById(id);
+    }
     @Transactional
     public Deployment rollback(Long id, String deployedBy, String idempotencyKey) {
-        Deployment target = getById(id);
+        Deployment target = deploymentRepository.getReferenceById(id);
 
-        if (idempotencyKey != null && !idempotencyKey.isBlank()) {
+        if (!StringUtils.isBlank(idempotencyKey)) {
             Optional<Deployment> existing = deploymentRepository.findByIdempotencyKey(idempotencyKey);
             if (existing.isPresent()) return existing.get();
         }
@@ -151,7 +157,7 @@ public class DeploymentManager {
 
     @Transactional
     public Deployment updateStatus(Long id, DeploymentStatus status) {
-        Deployment deployment = getById(id);
+        Deployment deployment = deploymentRepository.getReferenceById(id);;
         DeploymentStatus previous = deployment.getStatus();
 
         deployment.setStatus(status);
@@ -178,9 +184,8 @@ public class DeploymentManager {
         return historyManager.getByDeploymentId(deploymentId);
     }
 
-    @Transactional
     public void delete(Long id) {
-        Deployment deployment = getById(id);
+        Deployment deployment = deploymentRepository.getReferenceById(id);
         historyManager.deleteByDeploymentId(deployment.getId());
         deploymentRepository.delete(deployment);
     }

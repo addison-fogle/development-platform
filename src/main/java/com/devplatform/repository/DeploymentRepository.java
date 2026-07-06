@@ -7,10 +7,12 @@ import com.devplatform.model.Service;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.stereotype.Repository;
 
 import java.util.List;
 import java.util.Optional;
 
+@Repository
 public interface DeploymentRepository extends JpaRepository<Deployment, Long> {
 
     List<Deployment> findByEnvironmentAndCurrentTrue(Environment environment);
